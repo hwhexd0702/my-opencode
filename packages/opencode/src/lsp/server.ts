@@ -60,11 +60,15 @@ export namespace LSPServer {
     }
   }
 
+  export type RootMode = "nearest" | "workspace"
+
   export interface Info {
     id: string
     extensions: string[]
     global?: boolean
     root: RootFunction
+    rootMode?: RootMode
+    startAtProjectRoot?: boolean
     spawn(root: string): Promise<Handle | undefined>
   }
 

@@ -1159,6 +1159,16 @@ export namespace Config {
                 disabled: z.boolean().optional(),
                 env: z.record(z.string(), z.string()).optional(),
                 initialization: z.record(z.string(), z.any()).optional(),
+                rootMode: z
+                  .enum(["nearest", "workspace"])
+                  .optional()
+                  .describe(
+                    "Root detection mode: 'nearest' finds nearest project marker, 'workspace' uses project root",
+                  ),
+                startAtProjectRoot: z
+                  .boolean()
+                  .optional()
+                  .describe("Start LSP at project root on initialization instead of on-demand"),
               }),
             ]),
           ),

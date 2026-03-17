@@ -76,6 +76,13 @@ export namespace LSP {
     }
   }
 
+  function isSubPath(file: string, root: string): boolean {
+    const normalizedFile = path.resolve(file)
+    const normalizedRoot = path.resolve(root)
+    const relative = path.relative(normalizedRoot, normalizedFile)
+    return !relative.startsWith("..") && !path.isAbsolute(relative)
+  }
+
   const state = Instance.state(
     async () => {
       const clients: LSPClient.Info[] = []
@@ -109,6 +116,8 @@ export namespace LSP {
           ...existing,
           id: name,
           root: existing?.root ?? (async () => Instance.directory),
+          rootMode: item.rootMode ?? existing?.rootMode,
+          startAtProjectRoot: item.startAtProjectRoot ?? existing?.startAtProjectRoot,
           extensions: item.extensions ?? existing?.extensions ?? [],
           spawn: async (root) => {
             return {
@@ -145,7 +154,53 @@ export namespace LSP {
   )
 
   export async function init() {
-    return state()
+    const s = await state()
+
+    // Start LSP servers with startAtProjectRoot enabled
+    const startupTasks: Promise<void>[] = []
+    for (const server of Object.values(s.servers)) {
+      if (!server.startAtProjectRoot) continue
+      const root = Instance.directory
+      const key = root + server.id
+      if (s.broken.has(key)) continue
+      if (s.clients.some((x) => x.serverID === server.id && x.root === root)) continue
+
+      const task = (async () => {
+        const handle = await server.spawn(root).catch((err) => {
+          s.broken.add(key)
+          log.error(`Failed to spawn LSP server ${server.id}`, { error: err })
+          return
+        })
+        if (!handle) {
+          s.broken.add(key)
+          return
+        }
+
+        const client = await LSPClient.create({
+          serverID: server.id,
+          server: handle,
+          root,
+        }).catch((err) => {
+          s.broken.add(key)
+          handle.process.kill()
+          log.error(`Failed to initialize LSP client ${server.id}`, { error: err })
+          return
+        })
+
+        if (!client) {
+          handle.process.kill()
+          return
+        }
+
+        s.clients.push(client)
+        log.info(`Started LSP server ${server.id} at project root`, { root })
+      })()
+
+      startupTasks.push(task)
+    }
+
+    await Promise.all(startupTasks)
+    return s
   }
 
   export const Status = z
@@ -225,9 +280,17 @@ export namespace LSP {
     for (const server of Object.values(s.servers)) {
       if (server.extensions.length && !server.extensions.includes(extension)) continue
 
-      const root = await server.root(file)
+      // For workspace mode, use Instance.directory as root
+      const root = server.rootMode === "workspace" ? Instance.directory : await server.root(file)
       if (!root) continue
       if (s.broken.has(root + server.id)) continue
+
+      // Check if file is under any existing client's root for this server
+      const coveringClient = s.clients.find((x) => x.serverID === server.id && isSubPath(file, x.root))
+      if (coveringClient) {
+        result.push(coveringClient)
+        continue
+      }
 
       const match = s.clients.find((x) => x.root === root && x.serverID === server.id)
       if (match) {
@@ -267,9 +330,11 @@ export namespace LSP {
     const extension = path.parse(file).ext || file
     for (const server of Object.values(s.servers)) {
       if (server.extensions.length && !server.extensions.includes(extension)) continue
-      const root = await server.root(file)
+      const root = server.rootMode === "workspace" ? Instance.directory : await server.root(file)
       if (!root) continue
       if (s.broken.has(root + server.id)) continue
+      const coveringClient = s.clients.find((x) => x.serverID === server.id && isSubPath(file, x.root))
+      if (coveringClient) return true
       return true
     }
     return false
