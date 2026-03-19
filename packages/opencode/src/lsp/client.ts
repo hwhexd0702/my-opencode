@@ -12,6 +12,8 @@ import { NamedError } from "@opencode-ai/util/error"
 import { withTimeout } from "../util/timeout"
 import { Instance } from "../project/instance"
 import { Filesystem } from "../util/filesystem"
+import { Global } from "../global"
+import fs from "fs/promises"
 
 const DIAGNOSTICS_DEBOUNCE_MS = 150
 
@@ -39,14 +41,65 @@ export namespace LSPClient {
     ),
   }
 
+  function createLoggingConnection(reader: StreamMessageReader, writer: StreamMessageWriter, logFile: string) {
+    const connection = createMessageConnection(reader, writer)
+    const originalSendRequest = connection.sendRequest.bind(connection)
+    const originalSendNotification = connection.sendNotification.bind(connection)
+    const originalOnNotification = connection.onNotification.bind(connection)
+    const originalOnRequest = connection.onRequest.bind(connection)
+
+    const logWriter = Bun.file(logFile).writer({ highWaterMark: 0 })
+
+    const writeLog = (direction: string, method: string, data: any) => {
+      const timestamp = new Date().toISOString()
+      const msg = `[${timestamp}] ${direction} ${method}: ${JSON.stringify(data, null, 2)}\n`
+      logWriter.write(msg)
+    }
+
+    ;(connection as any).sendRequest = (method: string, ...args: any[]) => {
+      writeLog("SEND REQUEST", method, args)
+      return originalSendRequest(method, ...args)
+    }
+    ;(connection as any).sendNotification = (method: string, params?: any) => {
+      writeLog("SEND NOTIFICATION", method, params)
+      return originalSendNotification(method, params)
+    }
+    ;(connection as any).onNotification = (method: string | ((...args: any[]) => any), handler?: any) => {
+      if (typeof method === "function") {
+        return originalOnNotification(method)
+      }
+      return originalOnNotification(method, (params: any) => {
+        writeLog("RECV NOTIFICATION", method, params)
+        return handler(params)
+      })
+    }
+    ;(connection as any).onRequest = (method: string | ((...args: any[]) => any), handler?: any) => {
+      if (typeof method === "function") {
+        return originalOnRequest(method)
+      }
+      return originalOnRequest(method, (params: any) => {
+        writeLog("RECV REQUEST", method, params)
+        return handler(params)
+      })
+    }
+    ;(connection as any).logWriter = logWriter
+
+    return connection
+  }
+
   export async function create(input: { serverID: string; server: LSPServer.Handle; root: string }) {
     const l = log.clone().tag("serverID", input.serverID)
     l.info("starting client")
 
-    const connection = createMessageConnection(
-      new StreamMessageReader(input.server.process.stdout as any),
-      new StreamMessageWriter(input.server.process.stdin as any),
-    )
+    const logDir = path.join(Global.Path.log, "lsp")
+    await fs.mkdir(logDir, { recursive: true })
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+    const commLogFile = input.server.logFile ?? path.join(logDir, `${input.serverID}-${timestamp}-comm.log`)
+
+    const reader = new StreamMessageReader(input.server.process.stdout as any)
+    const writer = new StreamMessageWriter(input.server.process.stdin as any)
+
+    const connection = createLoggingConnection(reader, writer, commLogFile)
 
     const diagnostics = new Map<string, Diagnostic[]>()
     connection.onNotification("textDocument/publishDiagnostics", (params) => {
@@ -65,30 +118,31 @@ export namespace LSPClient {
       return null
     })
     connection.onRequest("workspace/configuration", async () => {
-      // Return server initialization options
       return [input.server.initialization ?? {}]
     })
     connection.onRequest("client/registerCapability", async () => {})
     connection.onRequest("client/unregisterCapability", async () => {})
-    connection.onRequest("workspace/workspaceFolders", async () => [
-      {
-        name: "workspace",
-        uri: pathToFileURL(input.root).href,
-      },
-    ])
+    connection.onRequest("workspace/workspaceFolders", async () => {
+      const folders = input.server.workspaceFolders ?? [input.root]
+      return folders.map((folder, index) => ({
+        name: path.basename(folder) || `workspace-${index}`,
+        uri: pathToFileURL(folder).href,
+      }))
+    })
     connection.listen()
 
-    l.info("sending initialize")
+    const workspaceFolders = input.server.workspaceFolders ?? [input.root]
+    const folderObjects = workspaceFolders.map((folder, index) => ({
+      name: path.basename(folder) || `workspace-${index}`,
+      uri: pathToFileURL(folder).href,
+    }))
+
+    l.info("sending initialize", { logFile: commLogFile, workspaceFolders })
     await withTimeout(
       connection.sendRequest("initialize", {
         rootUri: pathToFileURL(input.root).href,
         processId: input.server.process.pid,
-        workspaceFolders: [
-          {
-            name: "workspace",
-            uri: pathToFileURL(input.root).href,
-          },
-        ],
+        workspaceFolders: folderObjects,
         initializationOptions: {
           ...input.server.initialization,
         },
@@ -158,7 +212,7 @@ export namespace LSPClient {
               changes: [
                 {
                   uri: pathToFileURL(input.path).href,
-                  type: 2, // Changed
+                  type: 2,
                 },
               ],
             })
@@ -184,7 +238,7 @@ export namespace LSPClient {
             changes: [
               {
                 uri: pathToFileURL(input.path).href,
-                type: 1, // Created
+                type: 1,
               },
             ],
           })
@@ -217,7 +271,6 @@ export namespace LSPClient {
           new Promise<void>((resolve) => {
             unsub = Bus.subscribe(Event.Diagnostics, (event) => {
               if (event.properties.path === normalizedPath && event.properties.serverID === result.serverID) {
-                // Debounce to allow LSP to send follow-up diagnostics (e.g., semantic after syntax)
                 if (debounceTimer) clearTimeout(debounceTimer)
                 debounceTimer = setTimeout(() => {
                   log.info("got diagnostics", { path: normalizedPath })
@@ -240,11 +293,13 @@ export namespace LSPClient {
         connection.end()
         connection.dispose()
         input.server.process.kill()
+        ;(connection as any).logWriter?.end()
+        input.server.logWriter?.end()
         l.info("shutdown")
       },
     }
 
-    l.info("initialized")
+    l.info("initialized", { logFile: commLogFile })
 
     return result
   }

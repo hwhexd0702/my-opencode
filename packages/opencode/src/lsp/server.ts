@@ -13,6 +13,7 @@ import { Archive } from "../util/archive"
 import { Process } from "../util/process"
 import { which } from "../util/which"
 import { Module } from "@opencode-ai/util/module"
+import { Glob } from "../util/glob"
 
 const spawn = ((cmd, args, opts) => {
   if (Array.isArray(args)) return launch(cmd, [...args], { ...(opts ?? {}), windowsHide: true })
@@ -28,11 +29,6 @@ export namespace LSPServer {
       .catch(() => false)
   const run = (cmd: string[], opts: Process.RunOptions = {}) => Process.run(cmd, { ...opts, nothrow: true })
   const output = (cmd: string[], opts: Process.RunOptions = {}) => Process.text(cmd, { ...opts, nothrow: true })
-
-  export interface Handle {
-    process: ChildProcessWithoutNullStreams
-    initialization?: Record<string, any>
-  }
 
   type RootFunction = (file: string) => Promise<string | undefined>
 
@@ -62,6 +58,14 @@ export namespace LSPServer {
 
   export type RootMode = "nearest" | "workspace"
 
+  export interface Handle {
+    process: ChildProcessWithoutNullStreams
+    initialization?: Record<string, any>
+    logFile?: string
+    logWriter?: Bun.FileSink
+    workspaceFolders?: string[]
+  }
+
   export interface Info {
     id: string
     extensions: string[]
@@ -70,6 +74,28 @@ export namespace LSPServer {
     rootMode?: RootMode
     startAtProjectRoot?: boolean
     spawn(root: string): Promise<Handle | undefined>
+  }
+
+  async function scanJavaProjects(root: string): Promise<string[]> {
+    const projects: string[] = []
+    const markers = ["pom.xml", "build.gradle", "build.gradle.kts", ".project"]
+
+    for (const marker of markers) {
+      const matches = await Glob.scan(`**/${marker}`, {
+        cwd: root,
+        absolute: true,
+        include: "file",
+      }).catch(() => [] as string[])
+
+      for (const match of matches) {
+        const projectDir = path.dirname(match)
+        if (!projects.includes(projectDir)) {
+          projects.push(projectDir)
+        }
+      }
+    }
+
+    return projects
   }
 
   export const Deno: Info = {
@@ -1143,10 +1169,6 @@ export namespace LSPServer {
   export const JDTLS: Info = {
     id: "jdtls",
     root: async (file) => {
-      // Without exclusions, NearestRoot defaults to instance directory so we can't
-      // distinguish between a) no project found and b) project found at instance dir.
-      // So we can't choose the root from (potential) monorepo markers first.
-      // Look for potential subproject markers first while excluding potential monorepo markers.
       const settingsMarkers = ["settings.gradle", "settings.gradle.kts"]
       const gradleMarkers = ["gradlew", "gradlew.bat"]
       const exclusionsForMonorepos = gradleMarkers.concat(settingsMarkers)
@@ -1160,8 +1182,6 @@ export namespace LSPServer {
         NearestRoot(settingsMarkers)(file),
       ])
 
-      // If projectRoot is undefined we know we are in a monorepo or no project at all.
-      // So can safely fall through to the other roots
       if (projectRoot) return projectRoot
       if (wrapperRoot) return wrapperRoot
       if (settingsRoot) return settingsRoot
@@ -1235,28 +1255,83 @@ export namespace LSPServer {
         })(),
       )
       const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-jdtls-data"))
+
+      const logDir = path.join(Global.Path.log, "jdtls")
+      await fs.mkdir(logDir, { recursive: true })
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+      const logFile = path.join(logDir, `jdtls-${timestamp}.log`)
+
+      const args = [
+        "-jar",
+        launcherJar,
+        "-configuration",
+        configFile,
+        "-data",
+        dataDir,
+        "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+        "-Dosgi.bundles.defaultStartLevel=4",
+        "-Declipse.product=org.eclipse.jdt.ls.core.product",
+        "-Dlog.level=ALL",
+        "--add-modules=ALL-SYSTEM",
+        "--add-opens java.base/java.util=ALL-UNNAMED",
+        "--add-opens java.base/java.lang=ALL-UNNAMED",
+      ]
+
+      const cmdLine = [java, ...args].join(" ")
+
+      const javaProjects = await scanJavaProjects(root)
+      log.info("Starting JDTLS", {
+        root,
+        command: cmdLine,
+        logFile,
+        projectCount: javaProjects.length,
+        projects: javaProjects,
+      })
+
+      const projectsLog =
+        javaProjects.length > 0
+          ? `\nDiscovered Java Projects:\n${javaProjects.map((p, i) => `  ${i + 1}. ${p}`).join("\n")}\n\n`
+          : "\nNo Java projects discovered.\n\n"
+
+      await Bun.write(
+        logFile,
+        `JDTLS Startup Log\n================\nTime: ${new Date().toISOString()}\nRoot: ${root}\nCommand: ${cmdLine}\n${projectsLog}`,
+      )
+
+      const proc = spawn(java, args, {
+        cwd: root,
+        env: {
+          ...process.env,
+        },
+      })
+
+      const logStream = Bun.file(logFile).writer({ highWaterMark: 0 })
+
+      proc.stdout.on("data", (data) => {
+        const msg = `[${new Date().toISOString()}] STDOUT: ${data.toString()}`
+        logStream.write(msg)
+        log.debug("jdtls stdout", { data: data.toString() })
+      })
+
+      proc.stderr.on("data", (data) => {
+        const msg = `[${new Date().toISOString()}] STDERR: ${data.toString()}`
+        logStream.write(msg)
+        log.debug("jdtls stderr", { data: data.toString() })
+      })
+
+      proc.on("close", (code) => {
+        const msg = `[${new Date().toISOString()}] PROCESS EXIT: code=${code}\n`
+        logStream.write(msg)
+        logStream.end()
+        log.info("JDTLS process exited", { code })
+      })
+
       return {
-        process: spawn(
-          java,
-          [
-            "-jar",
-            launcherJar,
-            "-configuration",
-            configFile,
-            "-data",
-            dataDir,
-            "-Declipse.application=org.eclipse.jdt.ls.core.id1",
-            "-Dosgi.bundles.defaultStartLevel=4",
-            "-Declipse.product=org.eclipse.jdt.ls.core.product",
-            "-Dlog.level=ALL",
-            "--add-modules=ALL-SYSTEM",
-            "--add-opens java.base/java.util=ALL-UNNAMED",
-            "--add-opens java.base/java.lang=ALL-UNNAMED",
-          ],
-          {
-            cwd: root,
-          },
-        ),
+        process: proc,
+        initialization: {},
+        logFile,
+        logWriter: logStream,
+        workspaceFolders: javaProjects.length > 0 ? javaProjects : [root],
       }
     },
   }
